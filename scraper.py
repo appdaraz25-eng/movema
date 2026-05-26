@@ -301,6 +301,6 @@ async def run_scraper(start: int, end: int):
 
 
 if __name__ == "__main__":
-    START = 21_895_004
-    END   = 21_925_074
+    START = 21_925_074
+    END   = 21_925_096
     asyncio.run(run_scraper(START, END))
