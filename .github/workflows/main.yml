@@ -1,30 +1,28 @@
 name: Bollydrive Scraper
 
 on:
+  # ── Auto: every day at 5:00 PM Bangladesh time (= 11:00 AM UTC) ──────────
+  schedule:
+    - cron: "0 11 * * *"
+
+  # ── Manual override: optionally force a specific start ID ────────────────
   workflow_dispatch:
     inputs:
-      start_id:
-        description: "Start file ID"
-        required: true
-        default: "21925074"
-      end_id:
-        description: "End file ID"
-        required: true
-        default: "21925096"
-
-  # schedule:
-  #   - cron: "0 */6 * * *"
+      override_start_id:
+        description: "Force start from this ID (leave blank to auto-resume)"
+        required: false
+        default: ""
 
 jobs:
   scrape:
     name: Run Scraper
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 300        # 5h hard cap — scraper stops itself at 4h55m
     permissions:
-      contents: write
+      contents: write           # needed to commit result + state files
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────
+      # ── 1. Checkout (includes state.txt + result files from last run) ───
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -35,38 +33,41 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # ── 3. Install deps from requirements.txt ─────────────────────────
+      # ── 3. Install deps ────────────────────────────────────────────────
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 4. Show existing data sizes (persisted from previous runs) ─────
-      - name: Show existing data sizes
+      # ── 4. Show current state ──────────────────────────────────────────
+      - name: Show resume state and existing data
         run: |
+          if [ -f state.txt ]; then
+            echo "▶️  Resuming from ID: $(cat state.txt)"
+          else
+            echo "▶️  No state.txt found — starting from ID 1 (first run)"
+          fi
           for f in 1found.txt notfound.txt error.txt; do
             if [ -f "$f" ]; then
-              echo "$f: $(wc -l < $f) lines already stored"
+              echo "$f: $(wc -l < $f) lines stored"
             else
-              echo "$f: (new file — first run)"
+              echo "$f: (new — first run)"
             fi
           done
 
-      # ── 5. Patch start/end IDs from workflow inputs ────────────────────
-      - name: Patch scraper IDs
-        env:
-          START_ID: ${{ github.event.inputs.start_id }}
-          END_ID:   ${{ github.event.inputs.end_id }}
-        run: |
-          sed -i "s/START = .*/START = ${START_ID}/" scraper.py
-          sed -i "s/END   = .*/END   = ${END_ID}/"   scraper.py
-          echo "Scraping from ${START_ID} to ${END_ID}"
-
-      # ── 6. Run scraper ─────────────────────────────────────────────────
+      # ── 5. Run scraper (auto-resume or manual override) ────────────────
       - name: Run scraper
-        run: python scraper.py
+        run: |
+          OVERRIDE="${{ github.event.inputs.override_start_id }}"
+          if [ -n "$OVERRIDE" ]; then
+            echo "Manual override: starting from ID $OVERRIDE"
+            python scraper.py "$OVERRIDE"
+          else
+            echo "Auto-resume from state.txt"
+            python scraper.py
+          fi
 
-      # ── 7. Deduplicate txt files (post-run safety net) ─────────────────
+      # ── 6. Deduplicate result files (post-run safety net) ──────────────
       - name: Deduplicate result files
         run: |
           for f in 1found.txt notfound.txt error.txt; do
@@ -76,21 +77,23 @@ jobs:
             fi
           done
 
-      # ── 8. Commit result files back to repo ────────────────────────────
-      - name: Commit result files
+      # ── 7. Commit result files + state back to repo ────────────────────
+      - name: Commit results and state
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # Create files if they don't exist yet (first run safety)
-          touch 1found.txt notfound.txt error.txt
+          touch 1found.txt notfound.txt error.txt state.txt
 
-          git add 1found.txt notfound.txt error.txt
+          git add 1found.txt notfound.txt error.txt state.txt
+
+          NEXT_ID=$(cat state.txt 2>/dev/null || echo "?")
           git diff --cached --quiet || git commit -m \
-            "scraper: run ${{ github.run_number }} | ids=${{ github.event.inputs.start_id }}-${{ github.event.inputs.end_id }}"
+            "scraper: run #${{ github.run_number }} | next_id=${NEXT_ID}"
           git push
 
-      # ── 9. Print summary ───────────────────────────────────────────────
+      # ── 8. Print summary ───────────────────────────────────────────────
       - name: Print result summary
         if: always()
         run: |
@@ -100,8 +103,10 @@ jobs:
           wc -l notfound.txt 2>/dev/null || echo "(empty)"
           echo "=== ERRORS ==="
           wc -l error.txt    2>/dev/null || echo "(empty)"
+          echo "=== NEXT START ID ==="
+          cat state.txt      2>/dev/null || echo "(not saved)"
 
-      # ── 10. Upload artifacts ───────────────────────────────────────────
+      # ── 9. Upload artifacts ────────────────────────────────────────────
       - name: Upload result files as artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -111,10 +116,11 @@ jobs:
             1found.txt
             notfound.txt
             error.txt
+            state.txt
           retention-days: 90
           if-no-files-found: ignore
 
-      # ── 11. Fail job if server blocked ─────────────────────────────────
+      # ── 10. Fail job if server blocked ─────────────────────────────────
       - name: Check for server block
         if: always()
         run: |
