@@ -1,0 +1,124 @@
+name: Bollydrive Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_id:
+        description: "Start file ID"
+        required: true
+        default: "21895004"
+      end_id:
+        description: "End file ID"
+        required: true
+        default: "21925074"
+
+  # schedule:
+  #   - cron: "0 */6 * * *"
+
+jobs:
+  scrape:
+    name: Run Scraper
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Install deps ────────────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install aiohttp beautifulsoup4 lxml
+
+      # ── 4. Restore previous result files (keeps data across runs) ──────
+      #       The files are committed to the repo so each run reads them,
+      #       skips already-seen IDs, and appends only new unique lines.
+      - name: Show existing data sizes
+        run: |
+          for f in 1found.txt notfound.txt error.txt; do
+            if [ -f "$f" ]; then
+              echo "$f: $(wc -l < $f) lines already stored"
+            else
+              echo "$f: (new file)"
+            fi
+          done
+
+      # ── 5. Patch start/end IDs ─────────────────────────────────────────
+      - name: Patch scraper IDs
+        env:
+          START_ID: ${{ github.event.inputs.start_id }}
+          END_ID:   ${{ github.event.inputs.end_id }}
+        run: |
+          sed -i "s/START = .*/START = ${START_ID}/" scraper.py
+          sed -i "s/END   = .*/END   = ${END_ID}/"   scraper.py
+          echo "Scraping from ${START_ID} to ${END_ID}"
+
+      # ── 6. Run scraper ─────────────────────────────────────────────────
+      - name: Run scraper
+        run: python scraper.py
+
+      # ── 7. Deduplicate txt files (extra safety net post-run) ───────────
+      - name: Deduplicate result files
+        run: |
+          for f in 1found.txt notfound.txt error.txt; do
+            if [ -f "$f" ]; then
+              # Extract the leading serial number from each line and dedup
+              # Uses awk: keep only the first occurrence of each serial number
+              awk -F'|' '!seen[$1]++' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+              echo "$f after dedup: $(wc -l < $f) lines"
+            fi
+          done
+
+      # ── 8. Commit updated result files back to repo ────────────────────
+      #       This is what makes data persist across GitHub Actions runs.
+      - name: Commit result files
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add 1found.txt notfound.txt error.txt || true
+          git diff --cached --quiet || git commit -m \
+            "scraper: run ${{ github.run_number }} | \
+          ids=${{ github.event.inputs.start_id }}-${{ github.event.inputs.end_id }}"
+          git push
+
+      # ── 9. Summary ─────────────────────────────────────────────────────
+      - name: Print result summary
+        if: always()
+        run: |
+          echo "=== FOUND ==="
+          wc -l 1found.txt   2>/dev/null || echo "(empty)"
+          echo "=== NOT FOUND ==="
+          wc -l notfound.txt 2>/dev/null || echo "(empty)"
+          echo "=== ERRORS ==="
+          wc -l error.txt    2>/dev/null || echo "(empty)"
+
+      # ── 10. Upload artifacts ───────────────────────────────────────────
+      - name: Upload result files as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-results-${{ github.run_number }}
+          path: |
+            1found.txt
+            notfound.txt
+            error.txt
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # ── 11. Fail job if server blocked ─────────────────────────────────
+      - name: Check for server block
+        if: always()
+        run: |
+          if grep -q "BLOCKED\|BLOCK DETECTED" error.txt 2>/dev/null; then
+            echo "::error::Server block detected — check error.txt"
+            exit 1
+          fi
