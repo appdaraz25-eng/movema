@@ -33,26 +33,24 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      # ── 3. Install deps ────────────────────────────────────────────────
+      # ── 3. Install deps from requirements.txt ─────────────────────────
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install aiohttp beautifulsoup4 lxml
+          pip install -r requirements.txt
 
-      # ── 4. Restore previous result files (keeps data across runs) ──────
-      #       The files are committed to the repo so each run reads them,
-      #       skips already-seen IDs, and appends only new unique lines.
+      # ── 4. Show existing data sizes (persisted from previous runs) ─────
       - name: Show existing data sizes
         run: |
           for f in 1found.txt notfound.txt error.txt; do
             if [ -f "$f" ]; then
               echo "$f: $(wc -l < $f) lines already stored"
             else
-              echo "$f: (new file)"
+              echo "$f: (new file — first run)"
             fi
           done
 
-      # ── 5. Patch start/end IDs ─────────────────────────────────────────
+      # ── 5. Patch start/end IDs from workflow inputs ────────────────────
       - name: Patch scraper IDs
         env:
           START_ID: ${{ github.event.inputs.start_id }}
@@ -66,31 +64,28 @@ jobs:
       - name: Run scraper
         run: python scraper.py
 
-      # ── 7. Deduplicate txt files (extra safety net post-run) ───────────
+      # ── 7. Deduplicate txt files (post-run safety net) ─────────────────
       - name: Deduplicate result files
         run: |
           for f in 1found.txt notfound.txt error.txt; do
             if [ -f "$f" ]; then
-              # Extract the leading serial number from each line and dedup
-              # Uses awk: keep only the first occurrence of each serial number
               awk -F'|' '!seen[$1]++' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
               echo "$f after dedup: $(wc -l < $f) lines"
             fi
           done
 
-      # ── 8. Commit updated result files back to repo ────────────────────
-      #       This is what makes data persist across GitHub Actions runs.
+      # ── 8. Commit result files back to repo ────────────────────────────
+      #       Persists data so the next run skips already-processed IDs.
       - name: Commit result files
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add 1found.txt notfound.txt error.txt || true
           git diff --cached --quiet || git commit -m \
-            "scraper: run ${{ github.run_number }} | \
-          ids=${{ github.event.inputs.start_id }}-${{ github.event.inputs.end_id }}"
+            "scraper: run ${{ github.run_number }} | ids=${{ github.event.inputs.start_id }}-${{ github.event.inputs.end_id }}"
           git push
 
-      # ── 9. Summary ─────────────────────────────────────────────────────
+      # ── 9. Print summary ───────────────────────────────────────────────
       - name: Print result summary
         if: always()
         run: |
