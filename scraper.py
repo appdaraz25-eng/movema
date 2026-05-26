@@ -16,16 +16,24 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-# ─── Tier config ─────────────────────────────────────────────────────────────
-TIERS = [
-    {"name": "FAST",   "size": 10_000, "concurrency": 30, "delay": 0.0},
-    {"name": "MEDIUM", "size": 10_000, "concurrency": 15, "delay": 0.1},
-    {"name": "SLOW",   "size": 10_000, "concurrency":  5, "delay": 0.3},
+# ─── Tier profiles (sizes computed dynamically — 1/3 of total range each) ────
+TIER_PROFILES = [
+    {"name": "FAST",   "concurrency": 30, "delay": 0.0},
+    {"name": "MEDIUM", "concurrency": 15, "delay": 0.1},
+    {"name": "SLOW",   "concurrency":  5, "delay": 0.3},
 ]
+
+def build_tiers(total: int) -> list[dict]:
+    """Split total IDs into 3 equal parts; last tier absorbs remainder."""
+    base  = total // 3
+    sizes = [base, base, total - 2 * base]
+    return [{**TIER_PROFILES[i], "size": sizes[i]} for i in range(3)]
+
 
 FOUND_FILE    = "1found.txt"
 NOTFOUND_FILE = "notfound.txt"
 ERROR_FILE    = "error.txt"
+STATE_FILE    = "state.txt"       # persists last processed ID across runs
 
 ALL_FILES = [FOUND_FILE, NOTFOUND_FILE, ERROR_FILE]
 
@@ -34,20 +42,43 @@ BLOCK_WINDOW     = 50
 BLOCK_ERROR_RATE = 0.80
 BLOCK_CODES      = {403, 429, 503}
 
-# ─── ID regex: first token before ' | ' or end-of-line ───────────────────────
 _ID_RE = re.compile(r"^(\d+)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# Deduplication — load ALL seen serial numbers from ALL txt files at startup
+# State — resume from where last run ended
+# ════════════════════════════════════════════════════════════════════════════
+
+def load_start_id(override_start: int | None = None) -> int:
+    """
+    Returns the ID to start from:
+    - If override_start is given (manual workflow_dispatch), use it.
+    - Otherwise read state.txt for the next ID after the last run.
+    - If state.txt doesn't exist yet, start from 1.
+    """
+    if override_start is not None:
+        return override_start
+
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, encoding="utf-8") as f:
+            content = f.read().strip()
+            if content.isdigit():
+                return int(content)
+
+    return 1   # very first ever run
+
+
+def save_state(last_id: int):
+    """Write the next-start ID so the following run resumes correctly."""
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        f.write(str(last_id + 1))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Deduplication
 # ════════════════════════════════════════════════════════════════════════════
 
 def _load_seen_ids() -> set[int]:
-    """
-    Read every existing .txt output file and collect every serial number
-    that has ever been stored.  Works across runs — previous data is kept
-    and new duplicates are rejected.
-    """
     seen: set[int] = set()
     for path in ALL_FILES:
         if not os.path.exists(path):
@@ -66,13 +97,14 @@ def _load_seen_ids() -> set[int]:
 # ─── Globals ─────────────────────────────────────────────────────────────────
 lock          = asyncio.Lock()
 blocked_event = asyncio.Event()
+deadline_event= asyncio.Event()   # set when time limit is reached
 recent_results: list[bool] = []
 stats         = {"found": 0, "not_found": 0, "errors": 0, "skipped": 0, "total": 0}
 stats_lock    = asyncio.Lock()
 start_time    = time.time()
 
-# Populated once at startup; protected by `lock` for writes
 seen_ids: set[int] = set()
+last_processed_id:  int = 0      # updated after every successful fetch
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -80,14 +112,9 @@ seen_ids: set[int] = set()
 # ════════════════════════════════════════════════════════════════════════════
 
 async def save_unique(file: str, file_id: int, text: str) -> bool:
-    """
-    Write `text` to `file` ONLY if `file_id` has never been stored before
-    (in any file, in any previous or current run).
-    Returns True if written, False if it was a duplicate.
-    """
     async with lock:
         if file_id in seen_ids:
-            return False          # duplicate — skip silently
+            return False
         seen_ids.add(file_id)
         with open(file, "a", encoding="utf-8") as f:
             f.write(text + "\n")
@@ -110,18 +137,34 @@ async def record_result(ok: bool):
 
 
 async def update_stats(key: str, file_id: int = 0):
+    global last_processed_id
     async with stats_lock:
-        stats[key]    += 1
+        stats[key]     += 1
         stats["total"] += 1
+        if file_id:
+            last_processed_id = max(last_processed_id, file_id)
         elapsed = time.time() - start_time
         rps = stats["total"] / elapsed if elapsed > 0 else 0
+        remaining = max(0, TIME_LIMIT_SECONDS - elapsed)
         print(
             f"\r[{key.upper():9s}] #{file_id or '?':>10} | "
             f"found={stats['found']} nf={stats['not_found']} "
             f"err={stats['errors']} skip={stats['skipped']} "
-            f"total={stats['total']} rps={rps:.1f}",
+            f"total={stats['total']} rps={rps:.1f} "
+            f"time_left={int(remaining)}s",
             end="", flush=True,
         )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Deadline watcher — stops everything when time limit is hit
+# ════════════════════════════════════════════════════════════════════════════
+
+async def deadline_watcher(limit_seconds: float):
+    await asyncio.sleep(limit_seconds)
+    print(f"\n⏰  Time limit of {limit_seconds/3600:.2f}h reached — stopping gracefully.\n")
+    deadline_event.set()
+    blocked_event.set()   # reuse blocked_event so all workers exit
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -136,7 +179,6 @@ async def fetch(session: aiohttp.ClientSession,
     if blocked_event.is_set():
         return
 
-    # ── Fast skip: already processed in a previous run ───────────────────
     async with lock:
         already = file_id in seen_ids
     if already:
@@ -158,14 +200,10 @@ async def fetch(session: aiohttp.ClientSession,
                 timeout=aiohttp.ClientTimeout(total=20)
             ) as response:
 
-                # ── Instant block via HTTP status ─────────────────────
                 if response.status in BLOCK_CODES:
                     line = f"{file_id} | BLOCKED HTTP {response.status} | {url}"
                     await save_unique(ERROR_FILE, file_id, line)
-                    print(
-                        f"\n🚫  HTTP {response.status} on {file_id} "
-                        f"— server blocking detected. Stopping.\n"
-                    )
+                    print(f"\n🚫  HTTP {response.status} on {file_id} — server blocking. Stopping.\n")
                     await record_result(False)
                     await update_stats("errors", file_id)
                     blocked_event.set()
@@ -179,12 +217,9 @@ async def fetch(session: aiohttp.ClientSession,
                     return
 
                 html = await response.text(errors="ignore")
-
-                # ── Parse ─────────────────────────────────────────────
                 soup = BeautifulSoup(html, "html.parser")
                 h4   = soup.find("h4", class_="m-0 font-weight-bold text-primary")
 
-                # NOT FOUND
                 if h4 and "File not found" in h4.text:
                     line = f"{file_id} | File not found | {url}"
                     await save_unique(NOTFOUND_FILE, file_id, line)
@@ -192,7 +227,6 @@ async def fetch(session: aiohttp.ClientSession,
                     await update_stats("not_found", file_id)
                     return
 
-                # FOUND (valid media file)
                 if h4 and h4.text.strip():
                     name = h4.text.strip()
                     if any(ext in name for ext in (".mkv", ".mp4", ".avi")):
@@ -202,7 +236,6 @@ async def fetch(session: aiohttp.ClientSession,
                         await update_stats("found", file_id)
                         return
 
-                # Fallback → not found
                 line = f"{file_id} | NOT FOUND | {url}"
                 await save_unique(NOTFOUND_FILE, file_id, line)
                 await record_result(True)
@@ -230,7 +263,7 @@ async def run_tier(session: aiohttp.ClientSession,
                    tier: dict):
 
     if blocked_event.is_set():
-        print(f"⏭  Skipping tier {tier['name']} — blocked.")
+        print(f"⏭  Skipping tier {tier['name']} — stopped.")
         return
 
     concurrency = tier["concurrency"]
@@ -247,7 +280,7 @@ async def run_tier(session: aiohttp.ClientSession,
     chunk = concurrency * 4
     for i in range(0, len(tasks), chunk):
         if blocked_event.is_set():
-            print("\n⛔  Block detected — aborting tier early.")
+            print("\n⛔  Stopped — aborting tier early.")
             break
         await asyncio.gather(*tasks[i : i + chunk])
 
@@ -256,25 +289,47 @@ async def run_tier(session: aiohttp.ClientSession,
 # Main entry
 # ════════════════════════════════════════════════════════════════════════════
 
-async def run_scraper(start: int, end: int):
-    global seen_ids
+# 4 hours 55 minutes in seconds
+TIME_LIMIT_SECONDS = (4 * 60 + 55) * 60   # 17700 seconds
 
-    # ── Load all previously stored IDs (dedup across runs) ───────────────
+# How many IDs to process per session.
+# At ~30 req/s FAST tier this is ~500k; we use a large cap and rely on
+# the deadline_watcher to stop us at exactly 4h55m.
+IDS_PER_SESSION = 5_000_000
+
+
+async def run_scraper(override_start: int | None = None):
+    global seen_ids, last_processed_id
+
+    # ── Load previous state ───────────────────────────────────────────────
     seen_ids = _load_seen_ids()
-    print(f"♻️   Loaded {len(seen_ids):,} already-seen IDs from disk "
-          f"(duplicates will be skipped automatically).")
+    start    = load_start_id(override_start)
 
-    all_ids   = list(range(start, end + 1))
-    total_ids = len(all_ids)
-    fresh     = sum(1 for i in all_ids if i not in seen_ids)
-    print(f"📋  Range: {start}–{end}  |  total={total_ids:,}  "
-          f"new={fresh:,}  already-done={total_ids - fresh:,}\n")
+    print(f"♻️   Loaded {len(seen_ids):,} already-seen IDs from disk.")
+    print(f"▶️   Starting from ID: {start:,}")
+
+    end     = start + IDS_PER_SESSION - 1
+    all_ids = list(range(start, end + 1))
+    total   = len(all_ids)
+    fresh   = sum(1 for i in all_ids[:10_000] if i not in seen_ids)  # sample
+
+    tiers = build_tiers(total)
+
+    print(f"📋  Range: {start:,}–{end:,}  |  total={total:,}")
+    print(f"📊  Tier split: "
+          + "  |  ".join(f"{t['name']}={t['size']:,}" for t in tiers))
+    print(f"⏱️   Time limit: {TIME_LIMIT_SECONDS/3600:.2f}h (stops at 4h 55m)\n")
+
+    last_processed_id = start - 1
 
     connector = aiohttp.TCPConnector(limit=100, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
 
+        # Start the deadline watcher as a background task
+        watcher = asyncio.create_task(deadline_watcher(TIME_LIMIT_SECONDS))
+
         offset = 0
-        for tier in TIERS:
+        for tier in tiers:
             if blocked_event.is_set():
                 break
             batch = all_ids[offset : offset + tier["size"]]
@@ -283,24 +338,31 @@ async def run_scraper(start: int, end: int):
             await run_tier(session, batch, tier)
             offset += tier["size"]
 
-        # Remaining IDs (beyond 30 k) → SLOW tier
-        if not blocked_event.is_set() and offset < total_ids:
-            remaining = all_ids[offset:]
-            slow_tier = {**TIERS[-1], "name": "SLOW(remainder)"}
-            await run_tier(session, remaining, slow_tier)
+        watcher.cancel()
+
+    # ── Save state so next run resumes from here ──────────────────────────
+    save_state(last_processed_id)
 
     elapsed = time.time() - start_time
+    stopped_reason = "Time limit ⏰" if deadline_event.is_set() else \
+                     "Block detected ⛔" if blocked_event.is_set() else \
+                     "Completed ✅"
+
     print(f"\n\n{'═'*65}")
-    print(f"  Done in {elapsed:.1f}s")
+    print(f"  Stopped:   {stopped_reason}")
+    print(f"  Done in:   {elapsed:.1f}s  ({elapsed/3600:.2f}h)")
+    print(f"  Last ID:   {last_processed_id:,}")
+    print(f"  Next run starts at: {last_processed_id + 1:,}  (saved to {STATE_FILE})")
     print(f"  Found:     {stats['found']:,}")
     print(f"  Not found: {stats['not_found']:,}")
     print(f"  Errors:    {stats['errors']:,}")
-    print(f"  Skipped:   {stats['skipped']:,}  (duplicates from previous runs)")
-    print(f"  Blocked:   {'YES ⛔' if blocked_event.is_set() else 'No ✅'}")
+    print(f"  Skipped:   {stats['skipped']:,}")
     print(f"{'═'*65}\n")
 
 
 if __name__ == "__main__":
-    START = 21895004 
-    END   = 21896074 
-    asyncio.run(run_scraper(START, END))
+    import sys
+    # Optional: pass a start ID as CLI arg for manual override
+    # e.g.  python scraper.py 21925074
+    override = int(sys.argv[1]) if len(sys.argv) > 1 else None
+    asyncio.run(run_scraper(override))
