@@ -20,6 +20,8 @@ jobs:
     name: Run Scraper
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    permissions:
+      contents: write
 
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────
@@ -75,12 +77,15 @@ jobs:
           done
 
       # ── 8. Commit result files back to repo ────────────────────────────
-      #       Persists data so the next run skips already-processed IDs.
       - name: Commit result files
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add 1found.txt notfound.txt error.txt || true
+
+          # Create files if they don't exist yet (first run safety)
+          touch 1found.txt notfound.txt error.txt
+
+          git add 1found.txt notfound.txt error.txt
           git diff --cached --quiet || git commit -m \
             "scraper: run ${{ github.run_number }} | ids=${{ github.event.inputs.start_id }}-${{ github.event.inputs.end_id }}"
           git push
